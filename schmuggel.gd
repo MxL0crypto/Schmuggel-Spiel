@@ -9,6 +9,7 @@ extends Node
 ##
 ## Fahren: Knöpfe unten auf dem Bildschirm (mehrere Finger gleichzeitig gehen)
 ## oder Tastatur: W/↑ Gas, S/↓ Bremse, R rückwärts, A/D oder ←/→ lenken.
+## Auch alle Töne (Motor, Klopfen, Schranke) werden per Code erzeugt – keine Dateien nötig.
 
 # =====================================================================
 #  SPIELDATEN – hier passt du das Spiel an oder erweiterst es.
@@ -81,6 +82,7 @@ const MIN_GLAUBWUERDIGKEIT := 0.05   # ein kleines bisschen Glück bleibt immer
 # auf den Tablet-Bildschirm skaliert.
 const BASIS_AUFLOESUNG := Vector2i(1280, 800)
 const SCHRIFT_GROESSE := 26
+const HANDY_SCHRIFT_GROESSE := 22   # auf dem Handy etwas kleiner, damit alles ohne Scrollen passt
 const TITEL_GROESSE := 38
 const KNOPF_HOEHE := 70
 const GELB := Color("ffd166")
@@ -90,7 +92,7 @@ const ROT := Color("ef476f")
 # Wo die Infokarte steht: erst die Anker [links, oben, rechts, unten]
 # (0 = linker/oberer Bildschirmrand, 1 = rechter/unterer), dann der Abstand dazu in Pixeln.
 const KARTEN := {
-	"handy": [0.5, 0.5, 0.5, 0.5, -260, -370, 260, 370],
+	"handy": [0.5, 0.5, 0.5, 0.5, -260, -390, 260, 390],
 	"seite": [1, 0, 1, 1, -500, 64, -16, -16],
 	"unten": [0, 1, 1, 1, 16, -400, -16, -16],
 	"mitte": [0.5, 0.5, 0.5, 0.5, -400, -250, 400, 250],
@@ -104,6 +106,8 @@ const AUTO_HALBE_BREITE := 0.9
 const INSEL_HALBE_BREITE := 0.5
 const INSEL_HALBE_LAENGE := 4.0
 const SITZ := Vector3(-0.4, 1.2, 0.3)   # Augen des Fahrers im Auto
+const KONTROLL_BUCHT_Z := MAUT_Z - 25.0  # hier hinter der Maut wird rechts rangefahren
+const TON_RATE := 22050                  # Abtastrate der selbst gebauten Töne
 
 # =====================================================================
 #  SPIELZUSTAND
@@ -129,6 +133,13 @@ var tempo_geprueft := false
 var falsche_spur_gemeldet := false
 var halte_zeit := 0.0
 var finger := {}               # Touch-Nummer -> Position, damit Gas und Lenken gleichzeitig gehen
+var letzte_auto_pos := Vector3.ZERO   # damit Motor und Tacho merken, wie schnell das Auto wirklich ist
+var angezeigtes_tempo := 0.0
+
+# Töne
+var motor: AudioStreamPlayer
+var klopfen: AudioStreamPlayer
+var schranken_ton: AudioStreamPlayer
 
 # 3D-Welt
 var kamera: Camera3D
@@ -151,6 +162,7 @@ var inhalt: VBoxContainer
 var karte: PanelContainer
 var karten_stil: StyleBoxFlat
 var handy_stil: StyleBoxFlat
+var handy_thema: Theme
 var fahr_hud: Control
 var pedale := {}               # Name -> Knopf auf dem Bildschirm
 var meldung_tween: Tween
@@ -159,6 +171,7 @@ var meldung_tween: Tween
 func _ready() -> void:
 	_pruefe_daten()
 	_baue_welt()
+	_baue_toene()
 	_baue_oberflaeche()
 	_neues_spiel()
 
@@ -168,6 +181,15 @@ func _process(delta: float) -> void:
 		_fahre(delta)
 	if kamera_folgt:
 		kamera.global_transform = _fahrer_blick(kopf_drehung)
+	# Motor und Tacho folgen dem echten Tempo – egal ob du fährst oder das Auto automatisch rollt
+	if motor.playing and delta > 0:
+		var gemessen := auto.position.distance_to(letzte_auto_pos) / delta
+		angezeigtes_tempo = lerpf(angezeigtes_tempo, gemessen, minf(8.0 * delta, 1.0))
+		var anteil := minf(angezeigtes_tempo / MAX_TEMPO, 1.0)
+		motor.pitch_scale = 0.7 + anteil * 1.3
+		motor.volume_db = lerpf(-14.0, -4.0, anteil)
+		tacho.text = "%d km/h" % roundi(angezeigtes_tempo * 3.6)
+	letzte_auto_pos = auto.position
 
 
 # =====================================================================
@@ -194,6 +216,7 @@ func _neue_runde() -> void:
 	kontakt = ""
 	tempo_geprueft = false
 	falsche_spur_gemeldet = false
+	motor.stop()
 	tacho.text = "0 km/h"
 	auto.position = Vector3(_spur_mitte(int(SPUREN / 2.0)), 0, 0)
 	auto.rotation = Vector3.ZERO
@@ -230,16 +253,19 @@ func _zeige_handy() -> void:
 func _zeige_markt() -> void:
 	_neuer_bildschirm("Schmuggel-Shop", "handy")
 	_text("Kauf hier billig ein und verkauf drüben teurer.\nPlatz im Auto: %d von %d" % [_summe(gekauft), _gesamt_kapazitaet()])
+	# Eine Zeile pro Ware: [-]  Infos  [+]
 	for w in WAREN.size():
 		var ware: Dictionary = WAREN[w]
-		_text("%s\nKauf %d € · Verkauf %d €\nRisiko +%d %%" % [
-			ware.name, ware.einkauf, ware.verkauf, roundi(ware.risiko * 100)])
 		var zeile := _zeile()
 		var minus := _knopf("-", _zurueckgeben.bind(w), zeile)
 		minus.disabled = gekauft[w] == 0
-		_text("%d Stück" % gekauft[w], zeile).horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		_text("%s: %d Stück\nKauf %d € · Verkauf %d €\nRisiko +%d %%" % [
+			ware.name, gekauft[w], ware.einkauf, ware.verkauf, roundi(ware.risiko * 100)],
+			zeile).horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		var plus := _knopf("+", _kaufen.bind(w), zeile)
 		plus.disabled = geld < ware.einkauf or _summe(gekauft) >= _gesamt_kapazitaet()
+		minus.custom_minimum_size.x = 64
+		plus.custom_minimum_size.x = 64
 	_knopf("Fertig – Handy weg", _handy_weg)
 
 
@@ -340,6 +366,8 @@ func _einsteigen() -> void:
 	_karte_weg()
 	await _tween(kamera, "global_transform", _fahrer_blick(0.0), 1.5)
 	kamera_folgt = true
+	angezeigtes_tempo = 0.0
+	motor.play()
 	finger.clear()
 	halte_zeit = 0.0
 	verdacht_label.text = "Verdacht: 0 %"
@@ -373,7 +401,6 @@ func _fahre(delta: float) -> void:
 	_pruefe_hindernisse(vorher, delta)
 
 	lenkrad.rotation.y = lenkung * 2.0
-	tacho.text = "%d km/h" % roundi(absf(tempo) * 3.6)
 
 	if not tempo_geprueft and auto.position.z < MAUT_Z + 30.0:
 		tempo_geprueft = true
@@ -481,8 +508,10 @@ func _zeige_gespraech() -> void:
 	beamter.look_at(Vector3(fahrer.x, beamter.global_position.y, fahrer.z))
 	var zum_beamten := auto.to_local(beamter.global_position) - SITZ
 	await _tween(self, "kopf_drehung", atan2(-zum_beamten.x, -zum_beamten.z), 0.8)
+	klopfen.play()
+	await get_tree().create_timer(0.7).timeout
 	_neuer_bildschirm("An der Maut", "unten")
-	var frage := "Der Beamte beugt sich zu deinem Fenster:\n\"Guten Tag. Warum wollen Sie ins Nachbarland?\""
+	var frage := "Der Beamte klopft an die Scheibe:\n\"Guten Tag. Warum wollen Sie ins Nachbarland?\""
 	if verdacht > 0:
 		frage += "\nEr hat deine Fahrweise gesehen und schaut skeptisch (Verdacht %d %%)." % roundi(verdacht * 100)
 	_text(frage)
@@ -501,12 +530,13 @@ func _ausrede_gewaehlt(a: int) -> void:
 		_text("Der Beamte nickt: \"Alles klar. Gute Fahrt!\"")
 		_knopf("Weiterfahren", _durchfahren)
 	else:
-		_text("Der Beamte runzelt die Stirn: \"Das glaube ich Ihnen nicht. Aussteigen – Fahrzeugkontrolle!\"")
-		_knopf("Aussteigen", _zeige_durchsuchung)
+		_text("Der Beamte runzelt die Stirn: \"Das glaube ich Ihnen nicht. Fahren Sie hinter der Schranke rechts ran – Fahrzeugkontrolle!\"")
+		_knopf("Rechts ranfahren", _zeige_durchsuchung)
 
 
 func _durchfahren() -> void:
 	_karte_weg()
+	schranken_ton.play()
 	# Im Physik-Takt bewegen: der kommt vor _process, so hängt die Kamera dem Auto nicht hinterher
 	var tween := create_tween().set_parallel().set_process_mode(Tween.TWEEN_PROCESS_PHYSICS)
 	tween.tween_property(self, "kopf_drehung", 0.0, 0.8)
@@ -522,18 +552,36 @@ func _durchfahren() -> void:
 
 func _zeige_durchsuchung() -> void:
 	_karte_weg()
+	# Durch die Schranke und rechts ran: In der Kontrollbucht ist rundum Platz, da läuft der Beamte nirgends durch
+	var vor_der_bucht := Vector3(_spur_mitte(offene_spur), 0, MAUT_Z - 9)
+	var bucht := Vector3(_spur_mitte(SPUREN - 1), 0, KONTROLL_BUCHT_Z)
+	var richtung := bucht - vor_der_bucht
+	schranken_ton.play()
+	var fahrt := create_tween().set_parallel().set_process_mode(Tween.TWEEN_PROCESS_PHYSICS)
+	fahrt.tween_property(self, "kopf_drehung", 0.0, 0.8)
+	fahrt.tween_property(schranken[offene_spur], "rotation:z", deg_to_rad(80), 1.2)
+	fahrt.chain().tween_property(auto, "position", vor_der_bucht, 1.8).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+	fahrt.tween_property(auto, "rotation:y", 0.0, 0.8)
+	# Schräg rüberfahren: erst in Fahrtrichtung drehen, am Ende wieder gerade stellen
+	fahrt.chain().tween_property(auto, "position", bucht, 2.5).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
+	fahrt.tween_property(auto, "rotation:y", atan2(-richtung.x, -richtung.z), 0.6)
+	fahrt.tween_property(auto, "rotation:y", 0.0, 0.6).set_delay(1.9)
+	await fahrt.finished
+	motor.stop()
+
+	# Du steigst aus und wartest hinter der Leitplanke – von hier siehst du alles.
+	# Der Beamte kommt derweil von hinten rüber (gerade siehst du ihn nicht).
 	kamera_folgt = false
-	kopf_drehung = 0.0
-	# Du musst aussteigen und vorne rechts warten – von hier siehst du alles
+	beamter.global_position = auto.to_global(Vector3(-1.5, 0, 9))
 	var stehplatz := auto.to_global(Vector3(4.5, 3.8, -9.5))
 	await _tween(kamera, "global_transform", _blick(stehplatz, auto.to_global(Vector3(0, 0.5, 0))), 1.5)
 	_neuer_bildschirm("Durchsuchung", "seite")
-	_text("Der Beamte geht einmal ums Auto ...")
+	_text("Der Beamte kommt rüber und geht einmal ums Auto ...")
 
-	# Vom Häuschen zur Fahrertür ...
+	# Erst zur Fahrertür ...
 	var start := _um_das_auto(270.0)
-	beamter.look_at(Vector3(start.x, beamter.global_position.y, start.z))
-	await _tween(beamter, "global_position", start, 1.2)
+	beamter.look_at(start)
+	await _tween(beamter, "global_position", start, 2.5)
 
 	# ... und dann im Uhrzeigersinn an jedem Versteck vorbei
 	var reihenfolge := range(VERSTECKE.size())
@@ -926,6 +974,52 @@ func _baue_handy() -> void:
 	_klotz(Vector3(0.09, 0.05, 0.05), Vector3(0, -0.08, 0.02), Color("e0ac69"), handy)   # Hand
 
 
+# =====================================================================
+#  TÖNE – per Formel berechnet statt aus Dateien
+# =====================================================================
+
+func _baue_toene() -> void:
+	# Motor: Brummen mit Obertönen, läuft in Schleife; die Tonhöhe ändert sich mit dem Tempo (siehe _process)
+	motor = _lautsprecher(_ton(0.5, func(t: float) -> float:
+		var saege := 1.0 - 2.0 * fmod(t * 60.0, 1.0)
+		var tuckern := 0.75 + 0.25 * sin(TAU * 30.0 * t)
+		return (saege * 0.45 + sin(TAU * 120.0 * t) * 0.25 + randf_range(-0.08, 0.08)) * tuckern, true))
+	# Klopfen: drei kurze, dumpfe Schläge ans Fenster
+	klopfen = _lautsprecher(_ton(0.6, func(t: float) -> float:
+		var seit_schlag := fmod(t, 0.2)
+		return (sin(TAU * 170.0 * seit_schlag) * 0.8 + randf_range(-0.5, 0.5) * exp(-seit_schlag * 60.0)) * exp(-seit_schlag * 35.0)))
+	# Schranke: surrender Elektromotor, der höher wird, und am Ende ein "Klack"
+	schranken_ton = _lautsprecher(_ton(1.3, func(t: float) -> float:
+		var phase := TAU * (220.0 * t + 60.0 * t * t)
+		var surren := (signf(sin(phase)) * 0.2 + sin(2.0 * phase) * 0.15) * minf(t * 10.0, 1.0) * minf((1.3 - t) * 5.0, 1.0)
+		var klack := sin(TAU * 90.0 * (t - 1.15)) * exp(-(t - 1.15) * 30.0) if t > 1.15 else 0.0
+		return surren + klack))
+
+
+# Rechnet einen Ton aus: "welle" bekommt die Zeit in Sekunden und liefert einen Wert von -1 bis 1
+func _ton(dauer: float, welle: Callable, schleife := false) -> AudioStreamWAV:
+	var anzahl := int(dauer * TON_RATE)
+	var daten := PackedByteArray()
+	daten.resize(anzahl * 2)
+	for i in anzahl:
+		daten.encode_s16(i * 2, int(clampf(welle.call(float(i) / TON_RATE), -1.0, 1.0) * 32767))
+	var ton := AudioStreamWAV.new()
+	ton.format = AudioStreamWAV.FORMAT_16_BITS
+	ton.mix_rate = TON_RATE
+	ton.data = daten
+	if schleife:
+		ton.loop_mode = AudioStreamWAV.LOOP_FORWARD
+		ton.loop_end = anzahl
+	return ton
+
+
+func _lautsprecher(ton: AudioStream) -> AudioStreamPlayer:
+	var lautsprecher := AudioStreamPlayer.new()
+	lautsprecher.stream = ton
+	add_child(lautsprecher)
+	return lautsprecher
+
+
 # Ein Quader in einer Farbe
 func _klotz(groesse: Vector3, pos: Vector3, farbe: Color, eltern: Node = null) -> MeshInstance3D:
 	var kasten := BoxMesh.new()
@@ -991,7 +1085,9 @@ func _baue_oberflaeche() -> void:
 	handy_stil.set_border_width_all(14)
 	handy_stil.border_color = Color("0b0b0b")
 	handy_stil.set_corner_radius_all(44)
-	handy_stil.set_content_margin_all(30)
+	handy_stil.set_content_margin_all(24)
+	handy_thema = Theme.new()
+	handy_thema.default_font_size = HANDY_SCHRIFT_GROESSE
 	karte = PanelContainer.new()
 	wurzel.add_child(karte)
 
@@ -1089,6 +1185,7 @@ func _neuer_bildschirm(titel: String, art: String) -> void:
 	status_label.text = "Geld: %d €   ·   Runde %d" % [geld, runde]
 	_platziere(karte, KARTEN[art])
 	karte.add_theme_stylebox_override("panel", handy_stil if art == "handy" else karten_stil)
+	karte.theme = handy_thema if art == "handy" else null   # null = normale Schriftgröße von oben
 	karte.visible = true
 	for kind in inhalt.get_children():
 		kind.queue_free()
